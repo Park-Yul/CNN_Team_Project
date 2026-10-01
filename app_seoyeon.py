@@ -5,12 +5,18 @@
 - 이 파일은 라즈베리파이(10.10.17.105) 위에서 실행해야 합니다.
 
 설치:  pip install flask paramiko
-실행:  python3 app.py        ->  http://10.10.17.117:8000
+실행:  python3 app.py        ->  http://10.10.17.105:8000
 """
+import atexit
 import os
 import re
 import secrets
 import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
 import time
 
 import paramiko
@@ -19,12 +25,19 @@ from flask import (Flask, Response, redirect, render_template_string,
 
 PI_HOST = os.environ.get("PI_HOST", "10.10.17.105")
 PI_PORT = int(os.environ.get("PI_PORT", "22"))
+WEB_PORT = int(os.environ.get("WEB_PORT", "8000"))
 VENV_ACTIVATE = "work/yolo-env/bin/activate"
-SCRIPT_REL = "work/team_project/door_counter.py"
-TOTAL_LINE = 97                      # total 값이 있는 줄 번호(1부터)
+SCRIPT_NAME = "door_counter.py"      # 홈디렉터리 아래에서 자동 검색
+# 'total = 숫자' 형태의 줄 (== 비교, += 대입 등은 제외)
+TOTAL_RE = re.compile(r"^(\s*total\s*=(?!=)\s*)(-?\d+)(?!\d)")
 FRAME_PATH = "/tmp/door_frame.jpg"
 RUNNER_PATH = "/tmp/stream_runner.py"
 LOG_PATH = "/tmp/door_counter.log"
+PID_PATH = "/tmp/door_counter.pid"
+
+# 웹페이지 닫힘 감지(heartbeat) 설정
+LEAVE_GRACE = 10     # 탭 닫힘 신호(/leaving) 후, 이 시간(초) 동안 heartbeat가 없으면 종료
+HB_TIMEOUT = 90      # 신호 없이 heartbeat가 이 시간(초) 끊기면 종료 (브라우저 강제종료 등)
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -60,7 +73,7 @@ for _n in ("namedWindow", "destroyAllWindows", "destroyWindow",
            "resizeWindow", "moveWindow", "setWindowProperty"):
     setattr(cv2, _n, _noop)
 
-script = os.path.expanduser("~/work/team_project/door_counter.py")
+script = os.path.abspath(sys.argv[1])
 sys.argv = [script]
 runpy.run_path(script, run_name="__main__")
 '''
@@ -93,10 +106,21 @@ button,.btn{display:inline-block;margin-top:18px;padding:13px 20px;border:0;bord
 img.cam{width:100%;border-radius:10px;background:#000;min-height:240px}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
 .top a{color:var(--acc);font-size:.9rem}
+.lnk{margin:0;padding:0;background:none;color:var(--acc);font-weight:400;font-size:.9rem;border:0;cursor:pointer}
+.st{font-size:.9rem;margin:12px 0}
 </style></head><body><div class="wrap">
-{% if user %}<div class="top"><span>👤 {{ user }}@{{ host }}</span><a href="{{ url_for('logout') }}">로그아웃</a></div>{% endif %}
+{% if user %}<div class="top"><span>👤 {{ user }}@{{ host }}</span>
+<form method="post" action="{{ url_for('logout') }}" style="margin:0"><button class="lnk" type="submit">로그아웃</button></form></div>{% endif %}
 {{ body|safe }}
-</div></body></html>
+</div>
+{% if hb %}<script>
+(function(){
+  function ping(){ fetch('/ping',{method:'POST',cache:'no-store',keepalive:true}).catch(function(){}); }
+  ping(); setInterval(ping,3000);
+  window.addEventListener('pagehide',function(){ try{navigator.sendBeacon('/leaving');}catch(e){} });
+})();
+</script>{% endif %}
+</body></html>
 """
 
 LOGIN = """
@@ -110,7 +134,9 @@ LOGIN = """
 """
 
 MAIN = """
-<h1>Door Counter</h1><div class="sub">{{ venv }}</div>
+<h1>Door Counter</h1><div class="sub">{{ venv }}<br>{{ script }}</div>
+{% if msg %}<div class="msg {{ cls }}" style="margin:0 0 16px">{{ msg }}</div>{% endif %}
+<div class="st">{{ status }}</div>
 <div class="banners">
   <a class="banner" href="{{ url_for('setcount') }}">초기 인원수 설정</a>
   <a class="banner g" href="{{ url_for('run') }}">실행</a>
@@ -119,7 +145,7 @@ MAIN = """
 
 SETCOUNT = """
 <h1>초기 인원수 설정</h1>
-<div class="sub">door_counter.py {{ line }}번째 줄</div>
+<div class="sub">{{ path }}</div>
 <form class="card" method="post">
   <div class="msg">현재 {{ line }}행: <code>{{ current }}</code></div>
   <label>인원수를 설정해주세요</label>
@@ -133,6 +159,7 @@ SETCOUNT = """
 RUN = """
 <h1>실행 화면</h1>
 <div class="card">
+  <div class="st" style="margin-top:0">{{ status }}</div>
   {% if msg %}<div class="msg {{ cls }}">{{ msg }}</div>{% endif %}
   <img class="cam" src="{{ url_for('video') }}" alt="웹캠 화면 (시작 후 몇 초 걸릴 수 있습니다)">
   <form method="post" action="{{ url_for('stop') }}" style="display:inline">
@@ -143,10 +170,19 @@ RUN = """
 </div>
 """
 
+BYE = """
+<h1>로그아웃 완료</h1>
+<div class="card">
+  <div class="msg ok">door_counter.py 프로세스를 종료했고, 웹 서버를 종료해 포트 {{ port }}를 반환합니다.</div>
+  <div class="sub" style="margin-top:14px">다시 사용하려면 라즈베리파이에서 <code>python3 app.py</code> 를 다시 실행하세요.</div>
+</div>
+"""
 
-def page(body_tpl, **ctx):
+
+def page(body_tpl, hb=True, **ctx):
     body = render_template_string(body_tpl, host=PI_HOST, **ctx)
-    return render_template_string(BASE, body=body, host=PI_HOST, user=current_user())
+    return render_template_string(BASE, body=body, host=PI_HOST,
+                                  user=current_user(), hb=hb)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +217,62 @@ def ssh_exec(client, cmd, timeout=20):
     return out.channel.recv_exit_status(), o, e
 
 
+# 'stream_runner.py' 를 '[s]tream_runner.py' 로 쓰는 이유: pkill -f 가 자기 자신(bash -lc ...)의
+# 명령줄과 매칭되어 셸이 같이 죽는 문제를 피하기 위함.
+STOP_CMD = r"""
+PIDF=__PIDF__
+if [ -f "$PIDF" ] && grep -aq 'stream_[r]unner' "/proc/$(cat "$PIDF")/cmdline" 2>/dev/null; then
+  PID=$(cat "$PIDF")
+  kill -TERM -- "-$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null
+  for i in 1 2 3 4 5 6; do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done
+  kill -KILL -- "-$PID" 2>/dev/null
+  kill -KILL "$PID" 2>/dev/null
+fi
+rm -f "$PIDF"
+pkill -TERM -u "$(id -un)" -f '[s]tream_runner.py' 2>/dev/null
+sleep 0.5
+pkill -KILL -u "$(id -un)" -f '[s]tream_runner.py' 2>/dev/null
+rm -f __FRAME__ __FRAME__.tmp
+if pgrep -u "$(id -un)" -f '[s]tream_runner.py' >/dev/null; then echo RUNNING; else echo STOPPED; fi
+""".replace("__PIDF__", PID_PATH).replace("__FRAME__", FRAME_PATH)
+
+STATUS_CMD = ("if pgrep -u \"$(id -un)\" -f '[s]tream_runner.py' >/dev/null; "
+              "then echo RUNNING; else echo STOPPED; fi")
+
+
+def stop_runner(client):
+    """door_counter(래퍼 포함) 프로세스 그룹을 종료. 종료되었으면 True"""
+    try:
+        if client is not None:
+            tr = client.get_transport()
+            if tr and tr.is_active():
+                _, out, _ = ssh_exec(client, STOP_CMD, timeout=30)
+                return "STOPPED" in out
+    except Exception:
+        pass
+    # SSH 연결이 끊긴 경우: 같은 계정으로 실행 중이라면 로컬에서라도 종료 시도
+    try:
+        subprocess.run(["pkill", "-TERM", "-f", "[s]tream_runner.py"], timeout=5)
+        time.sleep(0.5)
+        subprocess.run(["pkill", "-KILL", "-f", "[s]tream_runner.py"], timeout=5)
+        for p in (FRAME_PATH, PID_PATH):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def runner_status(client):
+    try:
+        _, out, _ = ssh_exec(client, STATUS_CMD, timeout=10)
+        return "● 실행 중" if "RUNNING" in out else "■ 정지됨"
+    except Exception:
+        return "(상태 확인 실패)"
+
+
 def login_required(fn):
     from functools import wraps
 
@@ -192,16 +284,40 @@ def login_required(fn):
     return w
 
 
-def read_script_lines(client):
-    sftp = client.open_sftp()
-    try:
-        path = sftp.normalize(SCRIPT_REL)
-        with sftp.open(path, "r") as f:
-            text = f.read().decode("utf-8")
-        return sftp, path, text
-    except Exception:
-        sftp.close()
-        raise
+def find_script(client):
+    """홈디렉터리 아래에서 door_counter.py 를 찾아 절대경로를 반환 (없으면 None).
+    여러 개면 CNN_Team_Project 경로 우선, 그다음 가장 최근 수정된 것."""
+    cmd = (f'find "$HOME" -type f -name {SCRIPT_NAME} '
+           '-not -path "*/.cache/*" -not -path "*/site-packages/*" '
+           '-not -path "*/.local/*" -printf "%T@ %p\\n" 2>/dev/null | sort -rn')
+    _, out, _ = ssh_exec(client, cmd, timeout=60)
+    paths = [ln.split(" ", 1)[1] for ln in out.splitlines() if " " in ln]
+    if not paths:
+        return None
+    preferred = [p for p in paths if "CNN_Team_Project" in p]
+    return (preferred or paths)[0]
+
+
+def get_script(client):
+    c = current()
+    if not c.get("script"):
+        c["script"] = find_script(client)
+    return c["script"]
+
+
+def find_total_line(lines):
+    """'total = 숫자' 줄을 자동 검색. 여러 개면 들여쓰기가 가장 얕은(전역) 줄, 그다음 첫 줄.
+    반환: (0-based 인덱스, 후보 개수) 또는 (None, 0)"""
+    cands = []
+    for i, ln in enumerate(lines):
+        m = TOTAL_RE.match(ln)
+        if m:
+            indent = len(ln) - len(ln.lstrip())
+            cands.append((indent, i))
+    if not cands:
+        return None, 0
+    cands.sort()
+    return cands[0][1], len(cands)
 
 
 # ---------------------------------------------------------------------------
@@ -230,8 +346,9 @@ def login():
     venv = (f"✅ yolo-env 활성화됨 ({(out or err).strip()})" if code == 0
             else f"⚠️ yolo-env 활성화 실패: {err.strip()}")
 
+    script = find_script(cl)   # door_counter.py 자동 검색
     tok = secrets.token_hex(16)
-    SESSIONS[tok] = {"client": cl, "user": user, "venv": venv}
+    SESSIONS[tok] = {"client": cl, "user": user, "venv": venv, "script": script}
     session["tok"] = tok
     return redirect(url_for("main"))
 
@@ -239,7 +356,12 @@ def login():
 @app.route("/main")
 @login_required
 def main():
-    return page(MAIN, venv=current()["venv"])
+    cl = get_client()
+    script = get_script(cl)
+    flash = session.pop("flash", None) or (None, None)
+    return page(MAIN, venv=current()["venv"],
+                script=(f"📄 {script}" if script else f"⚠️ {SCRIPT_NAME} 를 찾지 못했습니다"),
+                status=f"door_counter.py: {runner_status(cl)}", msg=flash[0], cls=flash[1])
 
 
 @app.route("/setcount", methods=["GET", "POST"])
@@ -247,69 +369,85 @@ def main():
 def setcount():
     cl = get_client()
     msg = cls = None
+    path = get_script(cl)
+    if not path:
+        return page(SETCOUNT, path="", line="-", current="",
+                    msg=f"홈디렉터리에서 {SCRIPT_NAME} 를 찾지 못했습니다.", cls="err")
     try:
-        sftp, path, text = read_script_lines(cl)
+        sftp = cl.open_sftp()
+        with sftp.open(path, "r") as f:
+            text = f.read().decode("utf-8")
     except Exception as e:
-        return page(SETCOUNT, line=TOTAL_LINE, current="(읽기 실패)",
+        return page(SETCOUNT, path=path, line="-", current="(읽기 실패)",
                     msg=f"파일을 읽을 수 없습니다: {e}", cls="err")
 
     lines = text.split("\n")
-    cur = lines[TOTAL_LINE - 1] if len(lines) >= TOTAL_LINE else ""
+    idx, n = find_total_line(lines)
+    if idx is None:
+        sftp.close()
+        return page(SETCOUNT, path=path, line="-", current="",
+                    msg="파일에서 'total = 숫자' 형태의 줄을 찾지 못했습니다.", cls="err")
+    cur = lines[idx]
 
     if request.method == "POST":
         raw = request.form.get("total", "").strip()
         if not re.fullmatch(r"\d+", raw):
             msg, cls = "0 이상의 정수를 입력해주세요.", "err"
-        elif not re.match(r"^\s*total\s*=", cur):
-            msg, cls = (f"{TOTAL_LINE}행이 'total = ...' 형태가 아니어서 수정하지 않았습니다.\n"
-                        f"현재 내용: {cur}"), "err"
         else:
-            new = re.sub(r"^(\s*total\s*=\s*)-?\d+", lambda m: m.group(1) + raw, cur, count=1)
-            if new == cur and not re.match(r"^\s*total\s*=\s*-?\d+", cur):
-                msg, cls = f"숫자 값을 찾지 못했습니다: {cur}", "err"
-            else:
-                try:
-                    with sftp.open(path + ".bak", "w") as f:   # 백업
-                        f.write(text.encode("utf-8"))
-                    lines[TOTAL_LINE - 1] = new
-                    with sftp.open(path, "w") as f:            # 저장
-                        f.write("\n".join(lines).encode("utf-8"))
-                    cur = new
-                    msg, cls = f"저장 완료: total = {raw}  (백업: door_counter.py.bak)", "ok"
-                except Exception as e:
-                    msg, cls = f"저장 실패: {e}", "err"
+            new = TOTAL_RE.sub(lambda m: m.group(1) + raw, cur, count=1)
+            try:
+                with sftp.open(path + ".bak", "w") as f:   # 백업
+                    f.write(text.encode("utf-8"))
+                lines[idx] = new
+                with sftp.open(path, "w") as f:            # 저장
+                    f.write("\n".join(lines).encode("utf-8"))
+                cur = new
+                msg, cls = f"저장 완료: {idx + 1}행 total = {raw}  (백업: {SCRIPT_NAME}.bak)", "ok"
+            except Exception as e:
+                msg, cls = f"저장 실패: {e}", "err"
+    if n > 1 and not msg:
+        msg, cls = f"'total = 숫자' 줄이 {n}개 발견되어 가장 바깥쪽(들여쓰기 얕은) 줄을 선택했습니다.", ""
     sftp.close()
-    return page(SETCOUNT, line=TOTAL_LINE, current=cur.strip(), msg=msg, cls=cls)
+    return page(SETCOUNT, path=path, line=idx + 1, current=cur.strip(), msg=msg, cls=cls)
 
 
 @app.route("/run")
 @login_required
 def run():
     cl = get_client()
+    script = get_script(cl)
+    if not script:
+        return page(RUN, status="", msg=f"홈디렉터리에서 {SCRIPT_NAME} 를 찾지 못했습니다.", cls="err")
     try:
-        ssh_exec(cl, f"pkill -u $USER -f {RUNNER_PATH} || true")
+        stop_runner(cl)                     # 이전 실행이 남아 있으면 먼저 종료
         sftp = cl.open_sftp()
         with sftp.open(RUNNER_PATH, "w") as f:
             f.write(RUNNER_CODE.encode())
         sftp.close()
-        try:
-            os.remove(FRAME_PATH)
-        except FileNotFoundError:
-            pass
-        # python ./work/CNN_Team_Project/door_counter.py 와 동일하게 홈에서 실행(래퍼 경유)
-        cmd = (f"cd ~ && source {VENV_ACTIVATE} && "
-               f"nohup python {RUNNER_PATH} > {LOG_PATH} 2>&1 &")
-        cl.exec_command("bash -lc " + shlex.quote(cmd))
-        msg, cls = "door_counter.py 실행 중…", "ok"
+        # 홈에서 venv activate 후 python ./.../door_counter.py 실행(래퍼 경유).
+        # setsid: 별도 프로세스 그룹으로 띄워 나중에 그룹 전체를 한 번에 종료할 수 있게 함.
+        cmd = (f"source {VENV_ACTIVATE} && "
+               f"(setsid nohup python {RUNNER_PATH} {shlex.quote(script)} "
+               f"> {LOG_PATH} 2>&1 & echo $! > {PID_PATH}); "
+               f"sleep 1.5; "
+               f"if kill -0 $(cat {PID_PATH}) 2>/dev/null; then echo OK; else echo DEAD; fi")
+        _, out, err = ssh_exec(cl, cmd, timeout=30)
+        if "OK" in out:
+            msg, cls = f"실행 중: {script}", "ok"
+        else:
+            _, tail, _ = ssh_exec(cl, f"tail -n 15 {LOG_PATH} 2>/dev/null")
+            msg, cls = f"실행 직후 종료되었습니다.\n{tail or err}", "err"
     except Exception as e:
         msg, cls = f"실행 실패: {e}", "err"
-    return page(RUN, msg=msg, cls=cls)
+    return page(RUN, status=f"door_counter.py: {runner_status(cl)}", msg=msg, cls=cls)
 
 
 @app.route("/stop", methods=["POST"])
 @login_required
 def stop():
-    ssh_exec(get_client(), f"pkill -u $USER -f {RUNNER_PATH} || true")
+    ok = stop_runner(get_client())
+    session["flash"] = (("⏹ door_counter.py 를 중지했습니다.", "ok") if ok
+                        else ("⚠️ 중지를 확인하지 못했습니다. 로그를 확인하세요.", "err"))
     return redirect(url_for("main"))
 
 
@@ -324,29 +462,136 @@ def log():
 @login_required
 def video():
     def gen():
-        last = None
-        while True:
+        last, data, sent_at = None, None, 0
+        while not STOPPING.is_set():
             try:
                 m = os.path.getmtime(FRAME_PATH)
                 if m != last:
                     last = m
                     with open(FRAME_PATH, "rb") as f:
                         data = f.read()
-                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n")
+                    sent_at = 0
             except FileNotFoundError:
                 pass
+            now = time.time()
+            # 새 프레임이 있거나 2초 이상 정체되면 전송 -> 브라우저가 닫혔을 때 쓰기 오류로 스레드 종료
+            if data and (sent_at == 0 or now - sent_at > 2):
+                sent_at = now
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n")
             time.sleep(0.03)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-@app.route("/logout")
+# ---------------------------------------------------------------------------
+# 종료 / 포트 반환
+# ---------------------------------------------------------------------------
+STOPPING = threading.Event()
+HB = {"last": None, "leaving": None}
+
+
+def cleanup_all():
+    """모든 세션의 door_counter 종료 + SSH 연결 닫기 (여러 번 호출해도 안전)"""
+    items = list(SESSIONS.items())
+    SESSIONS.clear()
+    if not items:
+        stop_runner(None)       # 세션이 없어도 남은 프로세스가 있으면 정리 시도
+    for _, c in items:
+        try:
+            stop_runner(c["client"])
+        except Exception:
+            pass
+        try:
+            c["client"].close()
+        except Exception:
+            pass
+
+
+def shutdown_server(reason=""):
+    if STOPPING.is_set():
+        return
+    STOPPING.set()
+    print(f"[종료] {reason} -> door_counter 종료, 웹 서버 종료(포트 {WEB_PORT} 반환)", flush=True)
+    cleanup_all()
+    t = threading.Timer(5, lambda: os._exit(0))   # 정상 종료가 안 될 때의 안전장치
+    t.daemon = True
+    t.start()
+    try:
+        os.kill(os.getpid(), signal.SIGINT)        # app.run() 정상 종료 -> 소켓 close
+    except Exception:
+        os._exit(0)
+
+
+def watchdog():
+    while not STOPPING.is_set():
+        time.sleep(2)
+        last, leaving = HB["last"], HB["leaving"]
+        if last is None:
+            continue                                # 아직 아무도 접속 안 함
+        now = time.time()
+        if leaving and now - leaving > LEAVE_GRACE:
+            shutdown_server("웹페이지 닫힘 감지")
+        elif now - last > HB_TIMEOUT:
+            shutdown_server(f"{HB_TIMEOUT}초 동안 브라우저 응답 없음")
+
+
+@app.route("/ping", methods=["POST"])
+def ping():
+    HB["last"] = time.time()
+    HB["leaving"] = None
+    return ("", 204)
+
+
+@app.route("/leaving", methods=["POST"])
+def leaving():
+    HB["leaving"] = time.time()    # 새로고침/페이지 이동이면 곧바로 /ping 이 와서 취소됨
+    return ("", 204)
+
+
+@app.route("/logout", methods=["POST"])
 def logout():
     c = SESSIONS.pop(session.pop("tok", None), None)
     if c:
-        c["client"].close()
-    return redirect(url_for("login"))
+        stop_runner(c["client"])   # 로그아웃 시 door_counter 종료
+        try:
+            c["client"].close()
+        except Exception:
+            pass
+    html = page(BYE, hb=False, port=WEB_PORT)
+    threading.Timer(1.5, shutdown_server, args=("로그아웃",)).start()
+    return html
+
+
+def _on_signal(signum, frame):
+    cleanup_all()
+    sys.exit(0)
+
+
+def port_in_use(port):
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return False
+        except OSError:
+            return True
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, threaded=True)
-
+    if port_in_use(WEB_PORT):
+        print(f"[오류] 포트 {WEB_PORT} 를 이미 다른 프로세스가 사용 중입니다.\n"
+              f"  이전에 실행한 app.py 가 남아 있다면:  fuser -k {WEB_PORT}/tcp\n"
+              f"  또는 다른 포트로 실행:  WEB_PORT=8001 python3 app.py")
+        sys.exit(1)
+    for sig in (signal.SIGTERM, signal.SIGHUP):    # kill / 터미널 닫힘
+        signal.signal(sig, _on_signal)
+    signal.signal(signal.SIGINT, signal.default_int_handler)  # nohup/& 로 실행해도 종료 신호가 먹히도록
+    atexit.register(cleanup_all)
+    threading.Thread(target=watchdog, daemon=True).start()
+    try:
+        app.run(host="0.0.0.0", port=WEB_PORT, threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        STOPPING.set()
+        cleanup_all()
+        print(f"서버 종료 완료 - 포트 {WEB_PORT} 반환됨")

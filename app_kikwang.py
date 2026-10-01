@@ -2,10 +2,10 @@
 """
 라즈베리파이5 door_counter 웹 컨트롤러
 - 로그인(SSH 인증) -> 메인(초기 인원수 설정 / 실행)
-- 이 파일은 라즈베리파이(10.10.17.117) 위에서 실행해야 합니다.
+- 이 파일은 라즈베리파이(10.10.17.124) 위에서 실행해야 합니다.
 
 설치:  pip install flask paramiko
-실행:  python3 app.py        ->  http://10.10.17.117:8000
+실행:  python3 app.py        ->  http://10.10.17.124:8000
 """
 import atexit
 import os
@@ -23,10 +23,10 @@ import paramiko
 from flask import (Flask, Response, redirect, render_template_string,
                    request, session, url_for)
 
-PI_HOST = os.environ.get("PI_HOST", "10.10.17.117")
+PI_HOST = os.environ.get("PI_HOST", "10.10.17.124")
 PI_PORT = int(os.environ.get("PI_PORT", "22"))
 WEB_PORT = int(os.environ.get("WEB_PORT", "8000"))
-VENV_ACTIVATE = "work/yolo-env/bin/activate"
+VENV_ACTIVATE = "yolo-env/bin/activate"
 SCRIPT_NAME = "door_counter.py"      # 홈디렉터리 아래에서 자동 검색
 # 'total = 숫자' 형태의 줄 (== 비교, += 대입 등은 제외)
 TOTAL_RE = re.compile(r"^(\s*total\s*=(?!=)\s*)(-?\d+)(?!\d)")
@@ -169,6 +169,15 @@ RUN = """
   <a class="btn s" href="{{ url_for('log') }}" target="_blank">로그</a>
 </div>
 """
+
+BYE = """
+<h1>로그아웃 완료</h1>
+<div class="card">
+  <div class="msg ok">door_counter.py 프로세스를 종료했고, 웹 서버를 종료해 포트 {{ port }}를 반환합니다.</div>
+  <div class="sub" style="margin-top:14px">다시 사용하려면 라즈베리파이에서 <code>python3 app.py</code> 를 다시 실행하세요.</div>
+</div>
+"""
+
 
 def page(body_tpl, hb=True, **ctx):
     body = render_template_string(body_tpl, host=PI_HOST, **ctx)
@@ -540,15 +549,16 @@ def leaving():
 
 @app.route("/logout", methods=["POST"])
 def logout():
-    """로그아웃: door_counter.py 종료 + SSH 연결 닫기. 서버/포트는 유지."""
     c = SESSIONS.pop(session.pop("tok", None), None)
     if c:
-        stop_runner(c["client"])
+        stop_runner(c["client"])   # 로그아웃 시 door_counter 종료
         try:
             c["client"].close()
         except Exception:
             pass
-    return redirect(url_for("login"))
+    html = page(BYE, hb=False, port=WEB_PORT)
+    threading.Timer(1.5, shutdown_server, args=("로그아웃",)).start()
+    return html
 
 
 def _on_signal(signum, frame):
